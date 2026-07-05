@@ -1,0 +1,5 @@
+# 這只是一個佔位符，實際資料讀取由 utils/dataset.py 接管
+train: dummy
+val: dummy
+nc: 1
+names: ['dummy']

@@ -1,0 +1,45 @@
+# ==========================================
+# YOLOv9 / PyTorch 專用設定
+# ==========================================
+
+# 權重檔案 (Weights) - 避免把幾百 MB 的模型推上去
+*.pt
+*.pth
+*.onnx
+*.engine
+*.pb
+*.tflite
+
+# 資料集 (Datasets) - 預設 YOLO 常用的資料夾名稱
+datasets/
+dataset/
+data/*.zip
+data/*.tar.gz
+
+# 訓練結果與日誌 (Training Outputs & Logs)
+runs/
+wandb/
+tensorboard/
+*.log
+
+# ==========================================
+# Python 與環境預設設定
+# ==========================================
+
+# 虛擬環境 (Virtual Environments)
+venv/
+.venv/
+env/
+ENV/
+pyenv/
+
+# Python 快取
+__pycache__/
+*.py[cod]
+*$py.class
+
+# IDE 與系統暫存檔
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

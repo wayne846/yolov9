@@ -25,6 +25,76 @@ try:
 except ImportError:
     thop = None
 
+class WSKPNHead(nn.Module):
+    # WSKPN 影像重建與濾波頭
+    def __init__(self, kernel_num=6, ch=()):
+        super().__init__()
+        self.kernel_num = kernel_num
+        self.nl = 1
+        self.kernel_base_size = 3
+        self.kernel_size_stride = 2
+        
+        # ch[0] 是來自 YOLO 特徵圖的通道數 (例如第 31 層的通道數)
+        # ch[1] 是原始輸入影像的通道數 (10)
+        c_in = ch[0] 
+        output_channels = self.kernel_num * 2  # 前半部給 guidemap，後半部給 alpha
+
+        # 定義預測 Importance Map 和 Alpha 的卷積層
+        self.conv_final_5 = nn.Conv2d(in_channels=c_in, out_channels=output_channels, kernel_size=5, stride=1, padding=2, bias=False)
+        self.conv_final_3 = nn.Conv2d(in_channels=c_in, out_channels=output_channels, kernel_size=3, stride=1, padding=1, bias=False)
+        self.conv_final_1 = nn.Conv2d(in_channels=c_in, out_channels=output_channels, kernel_size=1, stride=1, padding=0, bias=False)
+        self.softmax = nn.Softmax2d()
+
+        # 初始化不同 Size 的濾波核 (取代原本 net.py 中的 SumKernelParameter)
+        self.convSs = nn.ModuleList()
+        for i in range(self.kernel_num):
+            kernel_size = self.kernel_base_size + i * self.kernel_size_stride
+            padding = (kernel_size - 1) // 2
+            convS = nn.Conv2d(in_channels=1, out_channels=1, kernel_size=kernel_size, stride=1, padding=padding, bias=False)
+            
+            # 將權重設為全 1，並凍結不參與訓練
+            kernel = torch.ones((1, 1, kernel_size, kernel_size), dtype=torch.float32)
+            convS.weight = nn.Parameter(kernel, requires_grad=False)
+            self.convSs.append(convS)
+
+    def forward(self, x):
+        # x[0] 是 YOLO 的特徵圖 (Downsampled)
+        # x[1] 是 原始 10 通道輸入影像 (Full Resolution)
+        features = x[0]
+        original_input = x[1]
+        B, _, H, W = original_input.shape
+
+        # 1. 將特徵圖上採樣 (Upsample) 回原圖解析度
+        features = torch.nn.functional.interpolate(features, size=(H, W), mode='bilinear', align_corners=False)
+
+        # 2. 預測 Guidemap 與 Alpha
+        x_final_5 = self.conv_final_5(features)
+        x_final_3 = self.conv_final_3(features)
+        x_final_1 = self.conv_final_1(features)
+        x_final_out = x_final_5 + x_final_3 + x_final_1
+
+        x_guidemap = torch.exp(x_final_out[:, :self.kernel_num])
+        x_alpha = self.softmax(x_final_out[:, self.kernel_num:])
+
+        # 3. 提取原圖的 Irradiance 與 Albedo
+        x_irradiance = original_input[:, 0:3]
+        x_albedo = original_input[:, 3:6]
+
+        # 4. 進行 Kernel Reconstruction 和 Filtering (使用 pure PyTorch 迴圈避免 CUDA 編譯問題)
+        x_out = 0.0
+        for i in range(self.kernel_num):
+            x_guidemap_windowsum = self.convSs[i](x_guidemap[:, i:(i+1)])
+            
+            # 使用 convSs 進行滑動視窗積分
+            filtered = self.convSs[i]((x_guidemap[:, i:(i+1)] * x_irradiance).view(-1, 1, H, W)).view(B, -1, H, W)
+            
+            # 加上 1e-6 避免除以零的數值不穩定
+            x_out += x_alpha[:, i:i+1] * (filtered / (x_guidemap_windowsum + 1e-6))
+
+        # 乘上 Albedo 獲得最終渲染結果
+        x_out = x_out * x_albedo
+        
+        return x_out
 
 class Detect(nn.Module):
     # YOLO Detect head for detection models
@@ -622,6 +692,11 @@ class DetectionModel(BaseModel):
             self.stride = m.stride
             m.bias_init()  # only run once
 
+        if isinstance(m, WSKPNHead):
+            # 給予 YOLO 預設的最大下採樣步長 32，以通過圖片大小檢查
+            m.stride = torch.tensor([32.0])  
+            self.stride = m.stride
+
         # Init weights, biases
         initialize_weights(self)
         self.info()
@@ -756,7 +831,7 @@ def parse_model(d, ch):  # model_dict, input_channels(3)
         elif m is CBFuse:
             c2 = ch[f[-1]]
         # TODO: channel, gw, gd
-        elif m in {Detect, DualDetect, TripleDetect, DDetect, DualDDetect, TripleDDetect, Segment, DSegment, DualDSegment, Panoptic}:
+        elif m in {Detect, DualDetect, TripleDetect, DDetect, DualDDetect, TripleDDetect, Segment, DSegment, DualDSegment, Panoptic, WSKPNHead}:
             args.append([ch[x] for x in f])
             # if isinstance(args[1], int):  # number of anchors
             #     args[1] = [list(range(args[1] * 2))] * len(f)

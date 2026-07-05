@@ -10,6 +10,15 @@ def smooth_BCE(eps=0.1):  # https://github.com/ultralytics/yolov3/issues/238#iss
     # return positive, negative label smoothing BCE targets
     return 1.0 - 0.5 * eps, 0.5 * eps
 
+class SMAPELoss(nn.Module):
+    def __init__(self, eps=0.01):
+        super(SMAPELoss, self).__init__()
+        self.eps = eps
+    
+    def forward(self, outputs, targets):
+        denominator = outputs
+        loss = torch.mean(torch.abs(outputs - targets) / (denominator.abs() + targets.abs() + self.eps))
+        return loss
 
 class BCEBlurWithLogitsLoss(nn.Module):
     # BCEwithLogitLoss() with reduced missing label effects.

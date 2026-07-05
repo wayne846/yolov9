@@ -25,6 +25,8 @@ ROOT = Path(os.path.relpath(ROOT, Path.cwd()))  # relative
 import val as validate  # for end-of-epoch mAP
 from models.experimental import attempt_load
 from models.yolo import Model
+import utils.dataset as wskpn_dataset
+from utils.loss import SMAPELoss
 from utils.autoanchor import check_anchors
 from utils.autobatch import check_train_batch_size
 from utils.callbacks import Callbacks
@@ -91,13 +93,17 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
     plots = not evolve and not opt.noplots  # create plots
     cuda = device.type != 'cpu'
     init_seeds(opt.seed + 1 + RANK, deterministic=True)
-    with torch_distributed_zero_first(LOCAL_RANK):
-        data_dict = data_dict or check_dataset(data)  # check if None
-    train_path, val_path = data_dict['train'], data_dict['val']
-    nc = 1 if single_cls else int(data_dict['nc'])  # number of classes
-    names = {0: 'item'} if single_cls and len(data_dict['names']) != 1 else data_dict['names']  # class names
-    #is_coco = isinstance(val_path, str) and val_path.endswith('coco/val2017.txt')  # COCO dataset
-    is_coco = isinstance(val_path, str) and val_path.endswith('val2017.txt')  # COCO dataset
+    # === 註解掉 YOLO 的資料集檢查 ===
+    # with torch_distributed_zero_first(LOCAL_RANK):
+    #     data_dict = data_dict or check_dataset(data)  # check if None
+    # train_path, val_path = data_dict['train'], data_dict['val']
+    
+    # === 手動給定預設值，騙過後續依賴這些變數的程式碼 ===
+    data_dict = {'nc': 1, 'val': '', 'names': {0: 'item'}}
+    train_path, val_path = '', ''
+    nc = 1  # WSKPN 不需要分類，設為 1 即可
+    names = {0: 'item'}  # 隨便給個名字
+    is_coco = False
 
     # Model
     check_suffix(weights, '.pt')  # check weights
@@ -106,14 +112,14 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
         with torch_distributed_zero_first(LOCAL_RANK):
             weights = attempt_download(weights)  # download if not found locally
         ckpt = torch.load(weights, map_location='cpu')  # load checkpoint to CPU to avoid CUDA memory leak
-        model = Model(cfg or ckpt['model'].yaml, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)  # create
+        model = Model(cfg or ckpt['model'].yaml, ch=10, nc=nc, anchors=hyp.get('anchors')).to(device)  # create
         exclude = ['anchor'] if (cfg or hyp.get('anchors')) and not resume else []  # exclude keys
         csd = ckpt['model'].float().state_dict()  # checkpoint state_dict as FP32
         csd = intersect_dicts(csd, model.state_dict(), exclude=exclude)  # intersect
         model.load_state_dict(csd, strict=False)  # load
         LOGGER.info(f'Transferred {len(csd)}/{len(model.state_dict())} items from {weights}')  # report
     else:
-        model = Model(cfg, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)  # create
+        model = Model(cfg, ch=10, nc=nc, anchors=hyp.get('anchors')).to(device)  # create
     amp = check_amp(model)  # check AMP
 
     # Freeze
@@ -174,41 +180,58 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
         LOGGER.info('Using SyncBatchNorm()')
 
     # Trainloader
-    train_loader, dataset = create_dataloader(train_path,
-                                              imgsz,
-                                              batch_size // WORLD_SIZE,
-                                              gs,
-                                              single_cls,
-                                              hyp=hyp,
-                                              augment=True,
-                                              cache=None if opt.cache == 'val' else opt.cache,
-                                              rect=opt.rect,
-                                              rank=LOCAL_RANK,
-                                              workers=workers,
-                                              image_weights=opt.image_weights,
-                                              close_mosaic=opt.close_mosaic != 0,
-                                              quad=opt.quad,
-                                              prefix=colorstr('train: '),
-                                              shuffle=True,
-                                              min_items=opt.min_items)
-    labels = np.concatenate(dataset.labels, 0)
-    mlc = int(labels[:, 0].max())  # max label class
-    assert mlc < nc, f'Label class {mlc} exceeds nc={nc} in {data}. Possible class labels are 0-{nc - 1}'
+    # train_loader, dataset = create_dataloader(train_path,
+    #                                           imgsz,
+    #                                           batch_size // WORLD_SIZE,
+    #                                           gs,
+    #                                           single_cls,
+    #                                           hyp=hyp,
+    #                                           augment=True,
+    #                                           cache=None if opt.cache == 'val' else opt.cache,
+    #                                           rect=opt.rect,
+    #                                           rank=LOCAL_RANK,
+    #                                           workers=workers,
+    #                                           image_weights=opt.image_weights,
+    #                                           close_mosaic=opt.close_mosaic != 0,
+    #                                           quad=opt.quad,
+    #                                           prefix=colorstr('train: '),
+    #                                           shuffle=True,
+    #                                           min_items=opt.min_items)
+    # labels = np.concatenate(dataset.labels, 0)
+    # mlc = int(labels[:, 0].max())  # max label class
+    # assert mlc < nc, f'Label class {mlc} exceeds nc={nc} in {data}. Possible class labels are 0-{nc - 1}'
+    database = wskpn_dataset.DataBase()
+    train_dataset = wskpn_dataset.BMFRFullResAlDataset(database, use_train=True)
+    train_loader = torch.utils.data.DataLoader(train_dataset, 
+                                               batch_size=batch_size // WORLD_SIZE, 
+                                               shuffle=True, 
+                                               num_workers=workers, 
+                                               pin_memory=True)
+    dataset = train_dataset  # 為了讓後面原本呼叫 dataset 的變數不報錯
+
+    # WSKPN 不需要分類標籤，將原本的 labels 設為 None 或空陣列以防報錯
+    labels = []
 
     # Process 0
     if RANK in {-1, 0}:
-        val_loader = create_dataloader(val_path,
-                                       imgsz,
-                                       batch_size // WORLD_SIZE * 2,
-                                       gs,
-                                       single_cls,
-                                       hyp=hyp,
-                                       cache=None if noval else opt.cache,
-                                       rect=True,
-                                       rank=-1,
-                                       workers=workers * 2,
-                                       pad=0.5,
-                                       prefix=colorstr('val: '))[0]
+        # val_loader = create_dataloader(val_path,
+        #                                imgsz,
+        #                                batch_size // WORLD_SIZE * 2,
+        #                                gs,
+        #                                single_cls,
+        #                                hyp=hyp,
+        #                                cache=None if noval else opt.cache,
+        #                                rect=True,
+        #                                rank=-1,
+        #                                workers=workers * 2,
+        #                                pad=0.5,
+        #                                prefix=colorstr('val: '))[0]
+        val_dataset = wskpn_dataset.BMFRFullResAlDataset(database, use_val=True)
+        val_loader = torch.utils.data.DataLoader(val_dataset, 
+                                                 batch_size=batch_size // WORLD_SIZE * 2, 
+                                                 shuffle=False, 
+                                                 num_workers=workers * 2, 
+                                                 pin_memory=True)
 
         if not resume:
             # if not opt.noautoanchor:
@@ -229,7 +252,8 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
     hyp['label_smoothing'] = opt.label_smoothing
     model.nc = nc  # attach number of classes to model
     model.hyp = hyp  # attach hyperparameters to model
-    model.class_weights = labels_to_class_weights(dataset.labels, nc).to(device) * nc  # attach class weights
+    # model.class_weights = labels_to_class_weights(dataset.labels, nc).to(device) * nc  # attach class weights
+    model.class_weights = torch.ones(nc, device=device)
     model.names = names
 
     # Start training
@@ -243,7 +267,8 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
     scheduler.last_epoch = start_epoch - 1  # do not move
     scaler = torch.cuda.amp.GradScaler(enabled=amp)
     stopper, stop = EarlyStopping(patience=opt.patience), False
-    compute_loss = ComputeLoss(model)  # init loss class
+    # compute_loss = ComputeLoss(model)  # init loss class
+    compute_loss = SMAPELoss()
     callbacks.run('on_train_start')
     LOGGER.info(f'Image sizes {imgsz} train, {imgsz} val\n'
                 f'Using {train_loader.num_workers * WORLD_SIZE} dataloader workers\n'
@@ -266,18 +291,26 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
         # b = int(random.uniform(0.25 * imgsz, 0.75 * imgsz + gs) // gs * gs)
         # dataset.mosaic_border = [b - imgsz, -b]  # height, width borders
 
-        mloss = torch.zeros(3, device=device)  # mean losses
+        # mloss = torch.zeros(3, device=device)  # mean losses
+        mloss = torch.zeros(3, device=device)
         if RANK != -1:
             train_loader.sampler.set_epoch(epoch)
         pbar = enumerate(train_loader)
-        LOGGER.info(('\n' + '%11s' * 7) % ('Epoch', 'GPU_mem', 'box_loss', 'cls_loss', 'dfl_loss', 'Instances', 'Size'))
+        # LOGGER.info(('\n' + '%11s' * 7) % ('Epoch', 'GPU_mem', 'box_loss', 'cls_loss', 'dfl_loss', 'Instances', 'Size'))
+        LOGGER.info(('\n' + '%11s' * 4) % ('Epoch', 'GPU_mem', 'SMAPE_loss', 'Size'))
         if RANK in {-1, 0}:
             pbar = tqdm(pbar, total=nb, bar_format=TQDM_BAR_FORMAT)  # progress bar
         optimizer.zero_grad()
-        for i, (imgs, targets, paths, _) in pbar:  # batch -------------------------------------------------------------
+        # for i, (imgs, targets, paths, _) in pbar:  # batch -------------------------------------------------------------
+        #     callbacks.run('on_train_batch_start')
+        #     ni = i + nb * epoch  # number integrated batches (since train start)
+        #     imgs = imgs.to(device, non_blocking=True).float() / 255  # uint8 to float32, 0-255 to 0.0-1.0
+        for i, (imgs, targets) in pbar:  # batch -------------------------------------------------------------
             callbacks.run('on_train_batch_start')
             ni = i + nb * epoch  # number integrated batches (since train start)
-            imgs = imgs.to(device, non_blocking=True).float() / 255  # uint8 to float32, 0-255 to 0.0-1.0
+            
+            # WSKPN 的資料已經是 float32 且範圍正確，不需要除以 255
+            imgs = imgs.to(device, non_blocking=True).float()
 
             # Warmup
             if ni <= nw:
@@ -301,7 +334,10 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
             # Forward
             with torch.cuda.amp.autocast(amp):
                 pred = model(imgs)  # forward
-                loss, loss_items = compute_loss(pred, targets.to(device))  # loss scaled by batch_size
+                # loss, loss_items = compute_loss(pred, targets.to(device))  # loss scaled by batch_size
+                loss = compute_loss(pred, targets.to(device))
+                loss_items = torch.zeros(3, device=device)
+                loss_items[0] = loss.detach()
                 if RANK != -1:
                     loss *= WORLD_SIZE  # gradient averaged between devices in DDP mode
                 if opt.quad:
@@ -325,9 +361,10 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
             if RANK in {-1, 0}:
                 mloss = (mloss * i + loss_items) / (i + 1)  # update mean losses
                 mem = f'{torch.cuda.memory_reserved() / 1E9 if torch.cuda.is_available() else 0:.3g}G'  # (GB)
-                pbar.set_description(('%11s' * 2 + '%11.4g' * 5) %
-                                     (f'{epoch}/{epochs - 1}', mem, *mloss, targets.shape[0], imgs.shape[-1]))
-                callbacks.run('on_train_batch_end', model, ni, imgs, targets, paths, list(mloss))
+                # pbar.set_description(('%11s' * 2 + '%11.4g' * 5) %
+                #                      (f'{epoch}/{epochs - 1}', mem, *mloss, targets.shape[0], imgs.shape[-1]))
+                pbar.set_description(('%11s' * 2 + '%11.4g' * 2) % (f'{epoch}/{epochs - 1}', mem, mloss[0], imgs.shape[-1]))
+                callbacks.run('on_train_batch_end', model, ni, imgs, targets, None, list(mloss))
                 if callbacks.stop_training:
                     return
             # end batch ------------------------------------------------------------------------------------------------

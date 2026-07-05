@@ -1,3 +1,7 @@
+import dataset as wskpn_dataset
+from skimage.metrics import structural_similarity
+from skimage.metrics import peak_signal_noise_ratio
+
 import argparse
 import json
 import os
@@ -24,6 +28,19 @@ from utils.metrics import ConfusionMatrix, ap_per_class, box_iou
 from utils.plots import output_to_target, plot_images, plot_val_study
 from utils.torch_utils import select_device, smart_inference_mode
 
+def BMFRGammaCorrection(img):
+    if isinstance(img, np.ndarray):
+        return np.clip(np.power(np.maximum(img, 0.0), 0.454545), 0.0, 1.0)
+    elif isinstance(img, torch.Tensor):
+        return torch.pow(torch.clamp(img, min=0.0, max=1.0), 0.454545)
+
+def ComputeMetrics(truth_img, test_img):    
+    truth_img = BMFRGammaCorrection(truth_img)
+    test_img  = BMFRGammaCorrection(test_img)
+    
+    SSIM = structural_similarity(truth_img, test_img, channel_axis=-1, data_range=1.0)
+    PSNR = peak_signal_noise_ratio(truth_img, test_img, data_range=1.0)
+    return SSIM, PSNR
 
 def save_one_txt(predn, save_conf, shape, file):
     # Save one txt result
@@ -152,170 +169,84 @@ def run(
         model.warmup(imgsz=(1 if pt else batch_size, 3, imgsz, imgsz))  # warmup
         pad, rect = (0.0, False) if task == 'speed' else (0.5, pt)  # square inference for benchmarks
         task = task if task in ('train', 'val', 'test') else 'val'  # path to train/val/test images
-        dataloader = create_dataloader(data[task],
-                                       imgsz,
-                                       batch_size,
-                                       stride,
-                                       single_cls,
-                                       pad=pad,
-                                       rect=rect,
-                                       workers=workers,
-                                       min_items=opt.min_items,
-                                       prefix=colorstr(f'{task}: '))[0]
+        database = wskpn_dataset.DataBase()
+        val_dataset = wskpn_dataset.BMFRFullResAlDataset(database, use_val=True)
+        dataloader = torch.utils.data.DataLoader(val_dataset, 
+                                                 batch_size=batch_size, 
+                                                 shuffle=False, 
+                                                 num_workers=workers, 
+                                                 pin_memory=True)
 
+    s = ('%20s' * 3) % ('Images', 'SSIM', 'PSNR')
+    
     seen = 0
-    confusion_matrix = ConfusionMatrix(nc=nc)
-    names = model.names if hasattr(model, 'names') else model.module.names  # get class names
-    if isinstance(names, (list, tuple)):  # old format
-        names = dict(enumerate(names))
-    class_map = coco80_to_coco91_class() if is_coco else list(range(1000))
-    s = ('%22s' + '%11s' * 6) % ('Class', 'Images', 'Instances', 'P', 'R', 'mAP50', 'mAP50-95')
-    tp, fp, p, r, f1, mp, mr, map50, ap50, map = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
-    dt = Profile(), Profile(), Profile()  # profiling times
-    loss = torch.zeros(3, device=device)
-    jdict, stats, ap, ap_class = [], [], [], []
+    SSIMs = []  # 新增：初始化 SSIM 儲存陣列
+    PSNRs = []  # 新增：初始化 PSNR 儲存陣列
+    loss = torch.zeros(1, device=device) # 因為 SMAPELoss 是純量
+    dt = Profile(), Profile(), Profile()
+    
     callbacks.run('on_val_start')
     pbar = tqdm(dataloader, desc=s, bar_format=TQDM_BAR_FORMAT)  # progress bar
-    for batch_i, (im, targets, paths, shapes) in enumerate(pbar):
+    for batch_i, (im, targets) in enumerate(pbar):
         callbacks.run('on_val_batch_start')
         with dt[0]:
             if cuda:
                 im = im.to(device, non_blocking=True)
                 targets = targets.to(device)
-            im = im.half() if half else im.float()  # uint8 to fp16/32
-            im /= 255  # 0 - 255 to 0.0 - 1.0
-            nb, _, height, width = im.shape  # batch size, channels, height, width
+            # 配合 YOLO 的半精度 (FP16) 驗證模式，動態轉換張量型態
+            im = im.half() if half else im.float()
+            targets = targets.half() if half else targets.float()
 
         # Inference
         with dt[1]:
-            preds, train_out = model(im) if compute_loss else (model(im, augment=augment), None)
+            # WSKPN 模型直接輸出重建影像
+            preds = model(im)
 
         # Loss
         if compute_loss:
-            loss += compute_loss(train_out, targets)[1]  # box, obj, cls
+            loss_val = compute_loss(preds, targets)
+            loss += loss_val.detach() if not isinstance(loss_val, tuple) else loss_val[1]
 
-        # NMS
-        targets[:, 2:] *= torch.tensor((width, height, width, height), device=device)  # to pixels
-        lb = [targets[targets[:, 0] == i, 1:] for i in range(nb)] if save_hybrid else []  # for autolabelling
-        with dt[2]:
-            preds = non_max_suppression(preds,
-                                        conf_thres,
-                                        iou_thres,
-                                        labels=lb,
-                                        multi_label=True,
-                                        agnostic=single_cls,
-                                        max_det=max_det)
+        # Metrics 評估
+        # 轉換為 numpy 陣列並調換維度為 (H, W, C)
+        output = preds.detach().cpu().numpy()[0].transpose((1, 2, 0))
+        target = targets.cpu().numpy()[0].transpose((1, 2, 0))
+        
+        SSIM_val, PSNR_val = ComputeMetrics(target, output)
+        SSIMs.append(SSIM_val)
+        PSNRs.append(PSNR_val)
 
-        # Metrics
-        for si, pred in enumerate(preds):
-            labels = targets[targets[:, 0] == si, 1:]
-            nl, npr = labels.shape[0], pred.shape[0]  # number of labels, predictions
-            path, shape = Path(paths[si]), shapes[si][0]
-            correct = torch.zeros(npr, niou, dtype=torch.bool, device=device)  # init
-            seen += 1
-
-            if npr == 0:
-                if nl:
-                    stats.append((correct, *torch.zeros((2, 0), device=device), labels[:, 0]))
-                    if plots:
-                        confusion_matrix.process_batch(detections=None, labels=labels[:, 0])
-                continue
-
-            # Predictions
-            if single_cls:
-                pred[:, 5] = 0
-            predn = pred.clone()
-            scale_boxes(im[si].shape[1:], predn[:, :4], shape, shapes[si][1])  # native-space pred
-
-            # Evaluate
-            if nl:
-                tbox = xywh2xyxy(labels[:, 1:5])  # target boxes
-                scale_boxes(im[si].shape[1:], tbox, shape, shapes[si][1])  # native-space labels
-                labelsn = torch.cat((labels[:, 0:1], tbox), 1)  # native-space labels
-                correct = process_batch(predn, labelsn, iouv)
-                if plots:
-                    confusion_matrix.process_batch(predn, labelsn)
-            stats.append((correct, pred[:, 4], pred[:, 5], labels[:, 0]))  # (correct, conf, pcls, tcls)
-
-            # Save/log
-            if save_txt:
-                save_one_txt(predn, save_conf, shape, file=save_dir / 'labels' / f'{path.stem}.txt')
-            if save_json:
-                save_one_json(predn, jdict, path, class_map)  # append to COCO-JSON dictionary
-            callbacks.run('on_val_image_end', pred, predn, path, names, im[si])
-
-        # Plot images
-        if plots and batch_i < 3:
-            plot_images(im, targets, paths, save_dir / f'val_batch{batch_i}_labels.jpg', names)  # labels
-            plot_images(im, output_to_target(preds), paths, save_dir / f'val_batch{batch_i}_pred.jpg', names)  # pred
-
-        callbacks.run('on_val_batch_end', batch_i, im, targets, paths, shapes, preds)
+        callbacks.run('on_val_batch_end', batch_i, im, targets, None, None, preds)
 
     # Compute metrics
-    stats = [torch.cat(x, 0).cpu().numpy() for x in zip(*stats)]  # to numpy
-    if len(stats) and stats[0].any():
-        tp, fp, p, r, f1, ap, ap_class = ap_per_class(*stats, plot=plots, save_dir=save_dir, names=names)
-        ap50, ap = ap[:, 0], ap.mean(1)  # AP@0.5, AP@0.5:0.95
-        mp, mr, map50, map = p.mean(), r.mean(), ap50.mean(), ap.mean()
-    nt = np.bincount(stats[3].astype(int), minlength=nc)  # number of targets per class
+    mean_ssim = np.mean(SSIMs)
+    mean_psnr = np.mean(PSNRs)
 
     # Print results
-    pf = '%22s' + '%11i' * 2 + '%11.3g' * 4  # print format
-    LOGGER.info(pf % ('all', seen, nt.sum(), mp, mr, map50, map))
-    if nt.sum() == 0:
-        LOGGER.warning(f'WARNING ⚠️ no labels found in {task} set, can not compute metrics without labels')
-
-    # Print results per class
-    if (verbose or (nc < 50 and not training)) and nc > 1 and len(stats):
-        for i, c in enumerate(ap_class):
-            LOGGER.info(pf % (names[c], seen, nt[c], p[i], r[i], ap50[i], ap[i]))
+    pf = '%20s' + '%20.4g' * 2  # print format
+    LOGGER.info(pf % (len(dataloader), mean_ssim, mean_psnr))
 
     # Print speeds
-    t = tuple(x.t / seen * 1E3 for x in dt)  # speeds per image
+    t = tuple(x.t / len(dataloader) * 1E3 for x in dt)  # speeds per image
     if not training:
-        shape = (batch_size, 3, imgsz, imgsz)
-        LOGGER.info(f'Speed: %.1fms pre-process, %.1fms inference, %.1fms NMS per image at shape {shape}' % t)
+        shape = (batch_size, 10, imgsz, imgsz)
+        LOGGER.info(f'Speed: %.1fms pre-process, %.1fms inference per image at shape {shape}' % t[:2])
 
-    # Plots
-    if plots:
-        confusion_matrix.plot(save_dir=save_dir, names=list(names.values()))
-        callbacks.run('on_val_end', nt, tp, fp, p, r, f1, ap, ap50, ap_class, confusion_matrix)
-
-    # Save JSON
-    if save_json and len(jdict):
-        w = Path(weights[0] if isinstance(weights, list) else weights).stem if weights is not None else ''  # weights
-        anno_json = str(Path(data.get('path', '../coco')) / 'annotations/instances_val2017.json')  # annotations json
-        pred_json = str(save_dir / f"{w}_predictions.json")  # predictions json
-        LOGGER.info(f'\nEvaluating pycocotools mAP... saving {pred_json}...')
-        with open(pred_json, 'w') as f:
-            json.dump(jdict, f)
-
-        try:  # https://github.com/cocodataset/cocoapi/blob/master/PythonAPI/pycocoEvalDemo.ipynb
-            check_requirements('pycocotools')
-            from pycocotools.coco import COCO
-            from pycocotools.cocoeval import COCOeval
-
-            anno = COCO(anno_json)  # init annotations api
-            pred = anno.loadRes(pred_json)  # init predictions api
-            eval = COCOeval(anno, pred, 'bbox')
-            if is_coco:
-                eval.params.imgIds = [int(Path(x).stem) for x in dataloader.dataset.im_files]  # image IDs to evaluate
-            eval.evaluate()
-            eval.accumulate()
-            eval.summarize()
-            map, map50 = eval.stats[:2]  # update results (mAP@0.5:0.95, mAP@0.5)
-        except Exception as e:
-            LOGGER.info(f'pycocotools unable to run: {e}')
+    callbacks.run('on_val_end', None, None, None, None, None, None, None, None, None, None)
 
     # Return results
     model.float()  # for training
-    if not training:
-        s = f"\n{len(list(save_dir.glob('labels/*.txt')))} labels saved to {save_dir / 'labels'}" if save_txt else ''
-        LOGGER.info(f"Results saved to {colorstr('bold', save_dir)}{s}")
-    maps = np.zeros(nc) + map
-    for i, c in enumerate(ap_class):
-        maps[c] = ap[i]
-    return (mp, mr, map50, map, *(loss.cpu() / len(dataloader)).tolist()), maps, t
+    
+    # 為了不破壞 train.py 裡面對 validation 回傳值的長度預期 (計算 fitness 用)，
+    # 我們包裝一個長度對應的 tuple，並將 PSNR 放進去當作挑選 best.pt 的指標。
+    # YOLO 預設回傳 (mp, mr, map50, map, loss...)，我們把 PSNR 塞在 map 的位置。
+    # 補齊 7 個元素，對應 YOLO 預期的 P, R, mAP50, mAP, val_box, val_obj, val_cls
+    # 這樣 fitness 函式也能完美利用 PSNR (放在第 4 個位置) 來挑選 best.pt
+    val_loss = (loss.cpu() / len(dataloader)).item()
+    results = (0.0, 0.0, mean_ssim, mean_psnr, val_loss, 0.0, 0.0)
+    maps = np.zeros(nc) + mean_psnr
+    
+    return results, maps, t
 
 
 def parse_opt():
