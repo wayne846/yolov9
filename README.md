@@ -1,3 +1,22 @@
+# Install
+```
+pip install scikit-image
+pip install pyexr
+```
+
+# Train
+```
+python train.py \
+   --cfg models/detect/yolov9-wskpn.yaml \
+   --data data/wskpn.yaml \
+   --hyp data/hyps/hyp.scratch-high.yaml \
+   --batch-size 16 \
+   --epochs 100 \
+   --imgsz 128 \
+   --device 0 \
+   --noplots
+```
+
 # YOLOv9
 
 Implementation of paper - [YOLOv9: Learning What You Want to Learn Using Programmable Gradient Information](https://arxiv.org/abs/2402.13616)
