@@ -73,7 +73,19 @@ class WSKPNHead(nn.Module):
         x_final_1 = self.conv_final_1(features)
         x_final_out = x_final_5 + x_final_3 + x_final_1
 
-        x_guidemap = torch.exp(x_final_out[:, :self.kernel_num])
+        # 1. 取出要送進 exp 的原始 Logits (形狀為 [Batch, Kernel_Num, H, W])
+        logits = x_final_out[:, :self.kernel_num]
+        
+        # 2. 尋找每個像素在所有 Kernel 通道中的最大值 (保持維度以利廣播計算)
+        # dim=1 代表在 Kernel_Num 這個維度上找最大值
+        max_val = torch.amax(logits, dim=1, keepdim=True)
+        
+        # 3. 減去最大值 (Shift-Invariant 技巧)
+        # 如此一來，最大的數值必為 0 (exp(0)=1)，其餘皆為負數，徹底免疫 Overflow！
+        safe_logits = logits - max_val
+        
+        # 4. 安全地執行指數運算
+        x_guidemap = torch.exp(safe_logits)
         x_alpha = self.softmax(x_final_out[:, self.kernel_num:])
 
         # 3. 提取原圖的 Irradiance 與 Albedo
