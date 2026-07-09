@@ -2,6 +2,7 @@ import os
 import sys
 import torch
 import pyexr
+import time
 import numpy as np
 import cv2
 import torch.nn.functional as F
@@ -51,8 +52,20 @@ def run_denoise():
             if pad_h > 0 or pad_w > 0:
                 imgs = F.pad(imgs, (0, pad_w, 0, pad_h), mode='replicate')
 
+            # 確保 GPU 前置作業完成
+            torch.cuda.synchronize()
+            start_time = time.time()
+
             # 模型前向傳播 (降噪)
             preds = model(imgs)
+
+            # 等待 GPU 運算完成
+            torch.cuda.synchronize()
+            end_time = time.time()
+            
+            # 計算並印出毫秒 (ms)
+            inference_time_ms = (end_time - start_time) * 1000
+            print(f"第 {i} 張圖片推論時間: {inference_time_ms:.2f} ms")
 
             # 將剛才補齊的邊緣裁切掉，恢復原始影像大小
             if pad_h > 0 or pad_w > 0:
