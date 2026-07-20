@@ -92,19 +92,28 @@ class WSKPNHead(nn.Module):
         x_irradiance = original_input[:, 0:3]
         x_albedo = original_input[:, 3:6]
 
-        # 4. 進行 Kernel Reconstruction 和 Filtering (使用 pure PyTorch 迴圈避免 CUDA 編譯問題)
+        # 設定縮放因子，將 HDR 數值強制壓在 65504 的安全線內
+        scale_factor = 100.0
+        x_irradiance_scaled = x_irradiance / scale_factor
+
+        # 4. 進行 Kernel Reconstruction 和 Filtering
         x_out = 0.0
         for i in range(self.kernel_num):
             x_guidemap_windowsum = self.convSs[i](x_guidemap[:, i:(i+1)])
             
-            # 使用 convSs 進行滑動視窗積分
-            filtered = self.convSs[i]((x_guidemap[:, i:(i+1)] * x_irradiance).view(-1, 1, H, W)).view(B, -1, H, W)
+            # 使用縮小後的 Irradiance 進行滑動視窗積分，徹底免疫 FP16 溢位
+            filtered = self.convSs[i]((x_guidemap[:, i:(i+1)] * x_irradiance_scaled).view(-1, 1, H, W)).view(B, -1, H, W)
             
-            # 加上 1e-6 避免除以零的數值不穩定
-            x_out += x_alpha[:, i:i+1] * (filtered / (x_guidemap_windowsum + 1e-6))
+            # 加上 1e-4 避免除以零
+            x_out += x_alpha[:, i:i+1] * (filtered / (x_guidemap_windowsum + 1e-4))
 
         # 乘上 Albedo 獲得最終渲染結果
         x_out = x_out * x_albedo
+
+        # 在輸出的最後一刻，才把數值放大 100 倍還原真實亮度
+        x_out = x_out * scale_factor
+
+        x_out = torch.clamp(x_out, min=0.0, max=65000.0)
         
         return x_out
 

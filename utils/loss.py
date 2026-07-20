@@ -11,13 +11,21 @@ def smooth_BCE(eps=0.1):  # https://github.com/ultralytics/yolov3/issues/238#iss
     return 1.0 - 0.5 * eps, 0.5 * eps
 
 class SMAPELoss(nn.Module):
-    def __init__(self, eps=0.01):
+    def __init__(self, eps=1e-4):
         super(SMAPELoss, self).__init__()
         self.eps = eps
     
     def forward(self, outputs, targets):
-        denominator = outputs
-        loss = torch.mean(torch.abs(outputs - targets) / (denominator.abs() + targets.abs() + self.eps))
+        outputs = outputs.float()
+        targets = targets.float()
+
+        numerator = torch.abs(outputs - targets)
+        denominator = torch.abs(outputs) + torch.abs(targets) + self.eps
+        
+        # 強迫分母最低不能小於 1e-4，防止反向傳播求導時分母平方暴增
+        denominator = torch.clamp(denominator, min=1e-4)
+        
+        loss = torch.mean(numerator / denominator)
         return loss
 
 class BCEBlurWithLogitsLoss(nn.Module):

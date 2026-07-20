@@ -206,7 +206,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                                                batch_size=batch_size // WORLD_SIZE, 
                                                shuffle=True, 
                                                num_workers=workers, 
-                                               pin_memory=True)
+                                               pin_memory=False)
     dataset = train_dataset  # 為了讓後面原本呼叫 dataset 的變數不報錯
 
     # WSKPN 不需要分類標籤，將原本的 labels 設為 None 或空陣列以防報錯
@@ -231,7 +231,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                                                  batch_size=batch_size // WORLD_SIZE * 2, 
                                                  shuffle=False, 
                                                  num_workers=workers * 2, 
-                                                 pin_memory=True)
+                                                 pin_memory=False)
 
         if not resume:
             # if not opt.noautoanchor:

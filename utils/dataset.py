@@ -1,115 +1,93 @@
 import numpy as np
 import os
-from tqdm import tqdm
-import pyexr
 import torch
 from torch.utils.data import Dataset
 import torchvision.transforms.functional as TF
-
-
-def Padding(img, w):
-    return np.pad(img, ((w, w), (w, w), (0, 0)))
+from tqdm import tqdm # 用來顯示載入進度
 
 class DataBase:
     def __init__(self, crop_size=128):
-        folder_name = os.path.join("dataset")
-        # scene_names = ["classroom", "living-room", "san-miguel", "sponza-glossy", "sponza"]
-        scene_names = ["sponza"]
-            
-        # img_num_per_scene = 60
-        img_num_per_scene = 5
-        albedo_file_names = [os.path.join(folder_name, scene_name, "inputs", "albedo"+str(i)+".exr") for scene_name in scene_names for i in range(img_num_per_scene)]
-        irradiance_file_names = [os.path.join(folder_name, scene_name, "acc_colors", "color"+str(i)+".exr") for scene_name in scene_names for i in range(img_num_per_scene)]
-        reference_file_names = [os.path.join(folder_name, scene_name, "inputs", "reference"+str(i)+".exr") for scene_name in scene_names for i in range(img_num_per_scene)]
-        normal_file_names = [os.path.join(folder_name, scene_name, "inputs", "shading_normal"+str(i)+".exr") for scene_name in scene_names for i in range(img_num_per_scene)]
-        depth_file_names = [os.path.join(folder_name, scene_name, "depth", "depth"+str(i)+".exr") for scene_name in scene_names for i in range(img_num_per_scene)] # already in range [0, 1]
+        folder_name = "dataset"
+        scene_names = ["arcade", "bistro", "living_room", "sibenik", "sponza", "subway"]
+        img_num_per_scene = 55
         
-        self.train_inputs, self.train_targets = [], []
-        self.test_inputs, self.test_targets = [], []
-        for i in tqdm(range(len(reference_file_names))):
-            irradiance_img = pyexr.read(irradiance_file_names[i])[:, :, :3] # ignore alpha channel
-            albedo_img = pyexr.read(albedo_file_names[i])[:, :, :3]
-            reference_img = pyexr.read(reference_file_names[i])[:, :, :3]
-            normal_img = pyexr.read(normal_file_names[i])[:, :, :3]
-            normal_img = normal_img * 0.5 + 0.5
-            depth_img = pyexr.read(depth_file_names[i])[:, :, 0:1]
-            depth_img = (depth_img - np.min(depth_img)) / (np.max(depth_img) - np.min(depth_img))
-
-            if i < (img_num_per_scene * 0.8) - 1:
-                inputs = np.concatenate((Padding(irradiance_img, crop_size),
-                                         Padding(albedo_img, crop_size),
-                                         Padding(normal_img, crop_size),
-                                         Padding(depth_img, crop_size)), axis=2)
-                targets = Padding(reference_img, crop_size)
-                
-                self.train_inputs.append(inputs)
-                self.train_targets.append(targets)
-            else:
-                inputs = np.concatenate((irradiance_img,
-                                         albedo_img,
-                                         normal_img,
-                                         depth_img), axis=2)
-                targets = reference_img
-                
-                self.test_inputs.append(inputs)
-                self.test_targets.append(targets)
-                
+        # 直接在記憶體中存放資料的 List
+        self.train_data = []
+        self.test_data = []
+        
+        print("Loading all tensors into RAM... (This may take a minute)")
+        
+        for scene_name in scene_names:
+            tensor_dir = os.path.join(folder_name, scene_name, "tensors")
             
-        H, W, _ = self.test_targets[0].shape
+            # 使用 tqdm 顯示載入進度
+            for i in tqdm(range(img_num_per_scene), desc=f"Loading {scene_name}"):
+                file_path = os.path.join(tensor_dir, f"frame_{i}.pt")
+                if not os.path.exists(file_path):
+                    continue
+
+                # 一次性讀取 Tensor 並常駐記憶體
+                data = torch.load(file_path)
+
+                split_idx = int(img_num_per_scene * 0.8)
+                if i < split_idx:
+                    self.train_data.append(data)
+                else:
+                    self.test_data.append(data)
+
+        # 設定影像邊界與裁切基準
+        H, W, _ = self.test_data[0]['targets'].shape
         self.img_h, self.img_w = H - crop_size, W - crop_size
-
-
+        print(f"Loaded {len(self.train_data)} train images and {len(self.test_data)} test images into RAM.")
 
 class BMFRFullResAlDataset(Dataset):
-    def __init__(self, database, use_train=False, use_val=False, use_test=False, train_crops_every_frame=77, val_crops_every_frame=20, crop_size=128): # BMFR
+    def __init__(self, database, use_train=False, use_val=False, use_test=False, train_crops_every_frame=77, val_crops_every_frame=20, crop_size=128):
         self.database = database
-        self.use_train = use_train
-        self.use_val = use_val
-        self.use_test = use_test
+        self.use_train, self.use_val, self.use_test = use_train, use_val, use_test
         self.train_crops_every_frame = train_crops_every_frame
         self.val_crops_every_frame = val_crops_every_frame
         self.crop_size = crop_size
 
-        def rotate90(inputs):
-            inputs = torch.rot90(inputs, 1, (1, 2))
-            return inputs
-        def rotate270(inputs):
-            inputs = torch.rot90(inputs, -1, (1, 2))
-            return inputs
+        def rotate90(inputs): return torch.rot90(inputs, 1, (1, 2))
+        def rotate270(inputs): return torch.rot90(inputs, -1, (1, 2))
         self.transforms = [TF.hflip, TF.vflip, rotate90, rotate270]
-        
-            
+
     def _apply_transform(self, input_img, target_img):
         if self.use_train or self.use_val:
-            # Random crop and convert ndarray to tensor
-            i, j = np.random.randint(self.database.img_h - self.crop_size), np.random.randint(self.database.img_w-self.crop_size)
-            input_crop = TF.to_tensor(input_img[i:i+self.crop_size, j:j+self.crop_size].astype(np.float32))
-            target_crop = TF.to_tensor(target_img[i:i+self.crop_size, j:j+self.crop_size].astype(np.float32))
+            i, j = np.random.randint(self.database.img_h - self.crop_size), np.random.randint(self.database.img_w - self.crop_size)
+            # 切割並將維度從 (H, W, C) 轉為 (C, H, W)
+            input_crop = input_img[i:i+self.crop_size, j:j+self.crop_size].permute(2, 0, 1)
+            target_crop = target_img[i:i+self.crop_size, j:j+self.crop_size].permute(2, 0, 1)
             
             if np.random.rand() > 0.5:
                 transform = np.random.choice(self.transforms)
                 input_crop = transform(input_crop)
                 target_crop = transform(target_crop)
-        elif self.use_test:
-            input_crop = TF.to_tensor(input_img.astype(np.float32))
-            target_crop = TF.to_tensor(target_img.astype(np.float32))
+        else:
+            input_crop = input_img.permute(2, 0, 1)
+            target_crop = target_img.permute(2, 0, 1)
             
         return input_crop, target_crop
         
     def __getitem__(self, idx):
+        # 這裡直接從記憶體拿資料，速度極快，不再有任何硬碟 I/O
         if self.use_test:
-            frame_idx = idx
-            return self._apply_transform(self.database.test_inputs[frame_idx], self.database.test_targets[frame_idx])
+            data = self.database.test_data[idx]
         elif self.use_train:
-            frame_idx = idx // self.train_crops_every_frame 
+            data = self.database.train_data[idx // self.train_crops_every_frame]
         elif self.use_val:
-            frame_idx = idx // self.val_crops_every_frame 
-        return self._apply_transform(self.database.train_inputs[frame_idx], self.database.train_targets[frame_idx])
+            data = self.database.train_data[idx // self.val_crops_every_frame]
+            
+        inputs = data['inputs']
+        targets = data['targets']
+
+        # 清洗資料，將 NaN 轉為 0.0，將無限大限制為合法數值
+        inputs = torch.nan_to_num(inputs, nan=0.0, posinf=1.0, neginf=0.0)
+        targets = torch.nan_to_num(targets, nan=0.0, posinf=1.0, neginf=0.0)
+            
+        return self._apply_transform(inputs, targets)
     
     def __len__(self):
-        if self.use_train:
-            return len(self.database.train_targets) * self.train_crops_every_frame
-        elif self.use_val:
-            return len(self.database.train_targets) * self.val_crops_every_frame
-        elif self.use_test:
-            return len(self.database.test_targets)
+        if self.use_train: return len(self.database.train_data) * self.train_crops_every_frame
+        elif self.use_val: return len(self.database.train_data) * self.val_crops_every_frame
+        elif self.use_test: return len(self.database.test_data)

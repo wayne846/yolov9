@@ -14,6 +14,7 @@ python train.py \
    --epochs 100 \
    --imgsz 128 \
    --device 0 \
+   --workers 4 \
    --noplots
 ```
 
