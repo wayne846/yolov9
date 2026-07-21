@@ -12,7 +12,6 @@ def Padding(img, w):
     return np.pad(img, ((w, w), (w, w), (0, 0)))
 
 def convert():
-    crop_size = 128
     folder_name = "dataset"
     # 將這裡替換成你實際有的場景名稱
     scene_names = ["arcade", "bistro", "living_room", "sibenik", "sponza", "subway"]
@@ -44,12 +43,9 @@ def convert():
             depth_img = pyexr.read(f_depth)[:, :, 0:1]
             depth_img = (depth_img - np.min(depth_img)) / (np.max(depth_img) - np.min(depth_img) + 1e-6)
 
-            # 合併特徵並 Padding
-            inputs = np.concatenate((Padding(irradiance_img, crop_size),
-                                     Padding(albedo_img, crop_size),
-                                     Padding(normal_img, crop_size),
-                                     Padding(depth_img, crop_size)), axis=2)
-            targets = Padding(reference_img, crop_size)
+            # 合併通道並儲存
+            inputs = np.concatenate((irradiance_img, albedo_img, normal_img, depth_img), axis=2)
+            targets = reference_img
 
             # 打包成 Dict 並存檔為 PyTorch Tensor
             tensor_dict = {

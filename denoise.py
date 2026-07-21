@@ -71,8 +71,6 @@ def run_denoise():
             if pad_h > 0 or pad_w > 0:
                 preds = preds[:, :, :H, :W]
 
-            padding_size = 128
-            preds = preds[:, :, padding_size:-padding_size, padding_size:-padding_size]
             
             # 取得輸出張量，並從 (1, C, H, W) 轉換為 NumPy 的 (H, W, C)
             output_img = preds[0].cpu().numpy().transpose(1, 2, 0)
